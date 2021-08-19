@@ -30,6 +30,7 @@ struct InstructionCategoryStats {
     control_flow: usize,
     direct_calls: usize,
     indirect_calls: usize,
+    constants: usize,
 }
 
 #[derive(Default, Debug)]
@@ -72,7 +73,7 @@ fn calc_size(wasm: &impl wasmbin::io::Encode) -> Result<usize> {
 }
 
 fn get_instruction_stats(funcs: &[Blob<FuncBody>]) -> Result<InstructionStats> {
-    use wasmbin::instructions::{Instruction as I, MemArg, Misc as M};
+    use wasmbin::instructions::{simd::SIMD, Instruction as I, MemArg, Misc as M};
 
     let mut stats = InstructionStats::default();
     for func in funcs {
@@ -92,7 +93,12 @@ fn get_instruction_stats(funcs: &[Blob<FuncBody>]) -> Result<InstructionStats> {
                 | I::Return
                 | I::Select
                 | I::SelectWithTypes(_) => stats.categories.control_flow += 1,
-                I::SIMD(_) => stats.proposals.simd += 1,
+                I::SIMD(i) => {
+                    stats.proposals.simd += 1;
+                    if let SIMD::V128Const(_) = i {
+                        stats.categories.constants += 1
+                    }
+                }
                 I::Atomic(_) => stats.proposals.atomics += 1,
                 I::RefFunc(_) | I::RefIsNull | I::RefNull(_) => stats.proposals.ref_types += 1,
                 I::Misc(i) => match i {
@@ -117,6 +123,9 @@ fn get_instruction_stats(funcs: &[Blob<FuncBody>]) -> Result<InstructionStats> {
                 I::ReturnCallIndirect(_) => {
                     stats.categories.indirect_calls += 1;
                     stats.proposals.tail_calls += 1;
+                }
+                I::I32Const(_) | I::I64Const(_) | I::F32Const(_) | I::F64Const(_) => {
+                    stats.categories.constants += 1
                 }
                 _ => {}
             }
