@@ -1,0 +1,12 @@
+[package]
+authors = ["Ingvar Stepanyan <rreverser@google.com>"]
+edition = "2018"
+name = "wasm-stats"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.43"
+wasmbin = {version = "0.3.1", features = ["proposals"]}
+written_size = "0.1.0"
