@@ -2,6 +2,7 @@ use anyhow::Result;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 use serde::Serialize;
+use std::io::Write;
 use wasmbin::{
     builtins::Blob,
     indices::{GlobalId, LocalId, MemId, TableId},
@@ -233,16 +234,21 @@ fn main() -> Result<()> {
         .filter_map(|path| {
             let get_filename = || -> Result<_> {
                 Ok(path
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("filename is not a valid string"))?
+                    .file_name()
+                    .and_then(|filename| filename.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("filename is missing or not a valid string"))?
                     .to_owned())
             };
             let handler = || -> Result<()> {
                 let wasm = std::fs::read(&path)?;
                 let mut stats = get_stats(&wasm)?;
                 stats.filename = get_filename()?;
-                let flattened = serde_value_flatten::to_flatten_maptree(".", None, &stats)?;
-                serde_json::ser::to_writer(&mut *writer.lock().unwrap(), &flattened)?;
+                let flattened = serde_value_flatten::to_flatten_maptree("_", None, &stats)?;
+                {
+                    let mut writer = writer.lock().unwrap();
+                    serde_json::ser::to_writer(&mut *writer, &flattened)?;
+                    writeln!(writer)?;
+                }
                 Ok(())
             };
             let result = handler();
