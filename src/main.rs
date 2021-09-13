@@ -1,4 +1,7 @@
 use anyhow::Result;
+use indicatif::ProgressBar;
+use rayon::prelude::*;
+use serde::Serialize;
 use wasmbin::{
     builtins::Blob,
     indices::{GlobalId, LocalId, MemId, TableId},
@@ -7,7 +10,7 @@ use wasmbin::{
 };
 use written_size::WrittenSize;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 struct RefStats {
     global: usize,
     local: usize,
@@ -15,7 +18,7 @@ struct RefStats {
     mem: usize,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 struct ProposalStats {
     atomics: usize,
     ref_types: usize,
@@ -24,7 +27,7 @@ struct ProposalStats {
     bulk: usize,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 struct InstructionCategoryStats {
     load_store: usize,
     control_flow: usize,
@@ -33,7 +36,7 @@ struct InstructionCategoryStats {
     constants: usize,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 struct InstructionStats {
     total: usize,
     refs: RefStats,
@@ -41,7 +44,7 @@ struct InstructionStats {
     categories: InstructionCategoryStats,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 struct SizeStats {
     code: usize,
     init: usize,
@@ -49,7 +52,7 @@ struct SizeStats {
     total: usize,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 struct ExternalStats {
     funcs: usize,
     memories: usize,
@@ -57,8 +60,9 @@ struct ExternalStats {
     tables: usize,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 struct Stats {
+    filename: String,
     funcs: usize,
     instructions: InstructionStats,
     size: SizeStats,
@@ -209,10 +213,51 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
 }
 
 fn main() -> Result<()> {
-    let filename = std::env::args_os()
+    let dir = std::env::args_os()
         .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("Please provide filename"))?;
-    let file = std::fs::read(filename)?;
-    println!("{:#?}", get_stats(&file)?);
+        .ok_or_else(|| anyhow::anyhow!("Please provide directory"))?;
+
+    let files = std::fs::read_dir(&dir)?
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("wasm"))
+        .collect::<Vec<_>>();
+
+    let pb = ProgressBar::new(files.len() as _);
+
+    let writer = std::sync::Mutex::new(std::io::BufWriter::new(std::fs::File::create(
+        std::path::Path::new(&dir).join("stats.json"),
+    )?));
+
+    let errors = files
+        .into_par_iter()
+        .filter_map(|path| {
+            let get_filename = || -> Result<_> {
+                Ok(path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("filename is not a valid string"))?
+                    .to_owned())
+            };
+            let handler = || -> Result<()> {
+                let wasm = std::fs::read(&path)?;
+                let mut stats = get_stats(&wasm)?;
+                stats.filename = get_filename()?;
+                let flattened = serde_value_flatten::to_flatten_maptree(".", None, &stats)?;
+                serde_json::ser::to_writer(&mut *writer.lock().unwrap(), &flattened)?;
+                Ok(())
+            };
+            let result = handler();
+            pb.inc(1);
+            Some(
+                result
+                    .err()?
+                    .context(get_filename().unwrap_or_else(|err| format!("<{}>", err))),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if !errors.is_empty() {
+        anyhow::bail!("Multiple errors: {:#?}", errors);
+    }
+
     Ok(())
 }
