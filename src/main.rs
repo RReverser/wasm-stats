@@ -2,8 +2,12 @@ use anyhow::{anyhow, Result};
 use duct::cmd;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
-use serde::Serialize;
-use std::{io::Write, path::Path};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashSet,
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
+    path::Path,
+};
 use wasmbin::{
     builtins::Blob,
     sections::{ExportDesc, FuncBody, ImportDesc, Section},
@@ -69,8 +73,8 @@ struct ExternalStats {
 }
 
 #[derive(Default, Debug, Serialize)]
-struct Stats {
-    filename: String,
+struct Stats<'a> {
+    filename: &'a str,
     funcs: usize,
     instr: InstructionStats,
     size: SizeStats,
@@ -451,6 +455,26 @@ fn main() -> Result<()> {
         .nth(1)
         .ok_or_else(|| anyhow!("Please provide directory"))?;
 
+    let mut output = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(Path::new(&dir).join("stats.json"))?;
+
+    output.seek(SeekFrom::Start(0))?;
+
+    let prev_files = BufReader::new(&mut output)
+        .lines()
+        .map(|line| -> Result<_> {
+            #[derive(Deserialize)]
+            struct QuickStats {
+                filename: String,
+            }
+
+            Ok(serde_json::from_str::<QuickStats>(&line?)?.filename)
+        })
+        .collect::<Result<HashSet<_>>>()?;
+
     let files = std::fs::read_dir(&dir)?
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("wasm"))
@@ -458,40 +482,35 @@ fn main() -> Result<()> {
 
     let pb = ProgressBar::new(files.len() as _);
 
-    let writer = std::sync::Mutex::new(std::io::BufWriter::new(std::fs::File::create(
-        std::path::Path::new(&dir).join("stats.json"),
-    )?));
+    let output = std::sync::Mutex::new(std::io::BufWriter::new(output));
 
     let errors = files
         .into_par_iter()
         .filter_map(|path| {
-            let get_filename = || -> Result<_> {
-                Ok(path
-                    .file_name()
-                    .and_then(|filename| filename.to_str())
-                    .ok_or_else(|| anyhow!("filename is missing or not a valid string"))?
-                    .to_owned())
-            };
-            let handler = || -> Result<()> {
-                let wasm = std::fs::read(&path)?;
-                let mut stats = get_stats(&wasm)?;
-                stats.filename = get_filename()?;
-                stats.size.wasm_opt = wasm_opt(&path)?;
-                let flattened = serde_value_flatten::to_flatten_maptree("_", None, &stats)?;
-                {
-                    let mut writer = writer.lock().unwrap();
-                    serde_json::ser::to_writer(&mut *writer, &flattened)?;
-                    writeln!(writer)?;
-                }
+            let filename = path
+                .file_name()
+                .expect("Missing filename")
+                .to_str()
+                .expect("Invalid filename")
+                .to_owned();
+            let result = if prev_files.contains(&filename) {
                 Ok(())
+            } else {
+                let handler = || -> Result<()> {
+                    let wasm = std::fs::read(&path)?;
+                    let mut stats = get_stats(&wasm)?;
+                    stats.filename = &filename;
+                    stats.size.wasm_opt = wasm_opt(&path)?;
+                    let flattened = serde_value_flatten::to_flatten_maptree("_", None, &stats)?;
+                    // Serialize to string to ensure atomic write of an entire line.
+                    let serialized = serde_json::to_string(&flattened)? + "\n";
+                    output.lock().unwrap().write_all(serialized.as_bytes())?;
+                    Ok(())
+                };
+                handler()
             };
-            let result = handler();
             pb.inc(1);
-            Some(
-                result
-                    .err()?
-                    .context(get_filename().unwrap_or_else(|err| format!("<{}>", err))),
-            )
+            Some(result.err()?.context(filename))
         })
         .collect::<Vec<_>>();
 
