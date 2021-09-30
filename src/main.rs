@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::io::Write;
 use wasmbin::{
     builtins::Blob,
-    sections::{payload, ExportDesc, FuncBody, ImportDesc},
+    sections::{payload, ExportDesc, FuncBody, ImportDesc, Section},
 };
 use written_size::WrittenSize;
 
@@ -50,6 +50,8 @@ struct SizeStats {
     init: usize,
     externals: usize,
     types: usize,
+    custom: usize,
+    descriptors: usize,
     total: usize,
 }
 
@@ -69,6 +71,7 @@ struct Stats {
     size: SizeStats,
     imports: ExternalStats,
     exports: ExternalStats,
+    has_start: bool,
 }
 
 fn calc_size(wasm: &impl wasmbin::io::Encode) -> Result<usize> {
@@ -282,6 +285,7 @@ macro_rules! get_external_stats {
 }
 
 fn get_stats(wasm: &[u8]) -> Result<Stats> {
+    let m = wasmbin::Module::decode_from(wasm)?;
     let mut stats = Stats {
         size: SizeStats {
             total: wasm.len(),
@@ -289,67 +293,91 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
         },
         ..Default::default()
     };
-    let m = wasmbin::Module::decode_from(wasm)?;
-    if let Some(code) = m.find_std_section::<payload::Code>() {
-        stats.size.code = calc_size(code)?;
-        let funcs = code.try_contents()?;
-        stats.funcs = funcs.len();
-        stats.instr = get_instruction_stats(funcs)?;
-    }
-    if let Some(section) = m.find_std_section::<payload::Data>() {
-        stats.size.init += calc_size(section)?;
-    }
-    if let Some(section) = m.find_std_section::<payload::Element>() {
-        stats.size.init += calc_size(section)?;
-    }
     let mut global_types = Vec::new();
-    if let Some(section) = m.find_std_section::<payload::Import>() {
-        stats.size.externals += calc_size(section)?;
-        stats.imports = get_external_stats!(section, ImportDesc);
-        for item in section.try_contents()? {
-            if let ImportDesc::Global(ty) = &item.desc {
-                global_types.push(ty.clone());
-                if ty.mutable {
-                    stats.instr.proposals.mutable_externals += 1;
+    for section in &m.sections {
+        match section {
+            Section::Code(section) => {
+                stats.size.code = calc_size(section)?;
+                let funcs = section.try_contents()?;
+                stats.funcs = funcs.len();
+                stats.instr = get_instruction_stats(funcs)?;
+            }
+            Section::Data(section) => {
+                stats.size.init += calc_size(section)?;
+            }
+            Section::Element(section) => {
+                stats.size.init += calc_size(section)?;
+            }
+            Section::Import(section) => {
+                stats.size.externals += calc_size(section)?;
+                stats.imports = get_external_stats!(section, ImportDesc);
+                for item in section.try_contents()? {
+                    if let ImportDesc::Global(ty) = &item.desc {
+                        global_types.push(ty.clone());
+                        if ty.mutable {
+                            stats.instr.proposals.mutable_externals += 1;
+                        }
+                    }
                 }
             }
-        }
-    }
-    if let Some(section) = m.find_std_section::<payload::Export>() {
-        stats.size.externals += calc_size(section)?;
-        stats.exports = get_external_stats!(section, ExportDesc);
-        if let Some(globals) = m.find_std_section::<payload::Global>() {
-            global_types.extend(
-                globals
-                    .try_contents()?
-                    .iter()
-                    .map(|global| global.ty.clone()),
-            );
-        }
-        for item in section.try_contents()? {
-            if let ExportDesc::Global(global_id) = item.desc {
-                if global_types
-                    .get(global_id.index as usize)
-                    .ok_or_else(|| anyhow!("Invalid global id {:?}", global_id))?
-                    .mutable
-                {
-                    stats.instr.proposals.mutable_externals += 1;
+            Section::Export(section) => {
+                stats.size.externals += calc_size(section)?;
+                stats.exports = get_external_stats!(section, ExportDesc);
+                if let Some(globals) = m.find_std_section::<payload::Global>() {
+                    global_types.extend(
+                        globals
+                            .try_contents()?
+                            .iter()
+                            .map(|global| global.ty.clone()),
+                    );
+                }
+                for item in section.try_contents()? {
+                    if let ExportDesc::Global(global_id) = item.desc {
+                        if global_types
+                            .get(global_id.index as usize)
+                            .ok_or_else(|| anyhow!("Invalid global id {:?}", global_id))?
+                            .mutable
+                        {
+                            stats.instr.proposals.mutable_externals += 1;
+                        }
+                    }
                 }
             }
-        }
-    }
-    if let Some(section) = m.find_std_section::<payload::Type>() {
-        stats.size.types += calc_size(section)?;
-        for ty in section.try_contents()? {
-            if ty.results.len() > 1 {
-                stats.instr.proposals.multi_value += 1;
+            Section::Type(section) => {
+                stats.size.types += calc_size(section)?;
+                for ty in section.try_contents()? {
+                    if ty.results.len() > 1 {
+                        stats.instr.proposals.multi_value += 1;
+                    }
+                }
             }
-        }
-    }
-    if let Some(section) = m.find_std_section::<payload::Memory>() {
-        for ty in section.try_contents()? {
-            if ty.is_shared {
-                stats.instr.proposals.atomics += 1;
+            Section::Memory(section) => {
+                stats.size.descriptors += calc_size(section)?;
+                for ty in section.try_contents()? {
+                    if ty.is_shared {
+                        stats.instr.proposals.atomics += 1;
+                    }
+                }
+            }
+            Section::Custom(section) => {
+                stats.size.custom += calc_size(section)?;
+            }
+            Section::Start(_) => {
+                stats.has_start = true;
+            }
+            Section::DataCount(_) => {
+                stats.instr.proposals.bulk += 1;
+            }
+            Section::Function(section) => {
+                stats.size.descriptors += calc_size(section)?;
+            }
+
+            Section::Table(section) => {
+                stats.size.descriptors += calc_size(section)?;
+            }
+
+            Section::Global(section) => {
+                stats.size.descriptors += calc_size(section)?;
             }
         }
     }
