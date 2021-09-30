@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
+use duct::cmd;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 use serde::Serialize;
-use std::io::Write;
+use std::{io::Write, path::Path};
 use wasmbin::{
     builtins::Blob,
     sections::{ExportDesc, FuncBody, ImportDesc, Section},
@@ -56,6 +57,7 @@ struct SizeStats {
     custom: usize,
     descriptors: usize,
     total: usize,
+    wasm_opt: usize,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -435,6 +437,15 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
     Ok(stats)
 }
 
+fn wasm_opt(path: &Path) -> Result<usize> {
+    let mut written_size = Vec::new();
+    std::io::copy(
+        &mut cmd!("wasm-opt", "-O", "-n", "-o", "-", path).reader()?,
+        &mut written_size,
+    )?;
+    Ok(written_size.len() as usize)
+}
+
 fn main() -> Result<()> {
     let dir = std::env::args_os()
         .nth(1)
@@ -465,6 +476,7 @@ fn main() -> Result<()> {
                 let wasm = std::fs::read(&path)?;
                 let mut stats = get_stats(&wasm)?;
                 stats.filename = get_filename()?;
+                stats.size.wasm_opt = wasm_opt(&path)?;
                 let flattened = serde_value_flatten::to_flatten_maptree("_", None, &stats)?;
                 {
                     let mut writer = writer.lock().unwrap();
