@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -6,7 +6,6 @@ use std::io::Write;
 use wasmbin::{
     builtins::Blob,
     sections::{payload, ExportDesc, FuncBody, ImportDesc},
-    types::GlobalType,
 };
 use written_size::WrittenSize;
 
@@ -303,12 +302,16 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
     if let Some(section) = m.find_std_section::<payload::Element>() {
         stats.size.init += calc_size(section)?;
     }
+    let mut global_types = Vec::new();
     if let Some(section) = m.find_std_section::<payload::Import>() {
         stats.size.externals += calc_size(section)?;
         stats.imports = get_external_stats!(section, ImportDesc);
         for item in section.try_contents()? {
-            if let ImportDesc::Global(GlobalType { mutable: true, .. }) = item.desc {
-                stats.instr.proposals.mutable_externals += 1;
+            if let ImportDesc::Global(ty) = &item.desc {
+                global_types.push(ty.clone());
+                if ty.mutable {
+                    stats.instr.proposals.mutable_externals += 1;
+                }
             }
         }
     }
@@ -316,12 +319,21 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
         stats.size.externals += calc_size(section)?;
         stats.exports = get_external_stats!(section, ExportDesc);
         if let Some(globals) = m.find_std_section::<payload::Global>() {
-            let globals = globals.try_contents()?;
-            for item in section.try_contents()? {
-                if let ExportDesc::Global(global_id) = item.desc {
-                    if globals[global_id.index as usize].ty.mutable {
-                        stats.instr.proposals.mutable_externals += 1;
-                    }
+            global_types.extend(
+                globals
+                    .try_contents()?
+                    .iter()
+                    .map(|global| global.ty.clone()),
+            );
+        }
+        for item in section.try_contents()? {
+            if let ExportDesc::Global(global_id) = item.desc {
+                if global_types
+                    .get(global_id.index as usize)
+                    .ok_or_else(|| anyhow!("Invalid global id {:?}", global_id))?
+                    .mutable
+                {
+                    stats.instr.proposals.mutable_externals += 1;
                 }
             }
         }
@@ -347,7 +359,7 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
 fn main() -> Result<()> {
     let dir = std::env::args_os()
         .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("Please provide directory"))?;
+        .ok_or_else(|| anyhow!("Please provide directory"))?;
 
     let files = std::fs::read_dir(&dir)?
         .map(|entry| entry.unwrap().path())
@@ -367,7 +379,7 @@ fn main() -> Result<()> {
                 Ok(path
                     .file_name()
                     .and_then(|filename| filename.to_str())
-                    .ok_or_else(|| anyhow::anyhow!("filename is missing or not a valid string"))?
+                    .ok_or_else(|| anyhow!("filename is missing or not a valid string"))?
                     .to_owned())
             };
             let handler = || -> Result<()> {
