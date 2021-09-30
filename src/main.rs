@@ -5,19 +5,9 @@ use serde::Serialize;
 use std::io::Write;
 use wasmbin::{
     builtins::Blob,
-    indices::{GlobalId, LocalId, MemId, TableId},
     sections::{payload, FuncBody},
-    visit::Visit,
 };
 use written_size::WrittenSize;
-
-#[derive(Default, Debug, Serialize)]
-struct RefStats {
-    global: usize,
-    local: usize,
-    table: usize,
-    mem: usize,
-}
 
 #[derive(Default, Debug, Serialize)]
 struct ProposalStats {
@@ -26,21 +16,28 @@ struct ProposalStats {
     simd: usize,
     tail_calls: usize,
     bulk: usize,
+    multi_value: usize,
+    non_trapping_conv: usize,
 }
 
 #[derive(Default, Debug, Serialize)]
 struct InstructionCategoryStats {
     load_store: usize,
+    local_var: usize,
+    global_var: usize,
+    table: usize,
+    memory: usize,
     control_flow: usize,
     direct_calls: usize,
     indirect_calls: usize,
     constants: usize,
+    wait_notify: usize,
+    other: usize,
 }
 
 #[derive(Default, Debug, Serialize)]
 struct InstructionStats {
     total: usize,
-    refs: RefStats,
     proposals: ProposalStats,
     categories: InstructionCategoryStats,
 }
@@ -50,6 +47,7 @@ struct SizeStats {
     code: usize,
     init: usize,
     externals: usize,
+    types: usize,
     total: usize,
 }
 
@@ -65,7 +63,7 @@ struct ExternalStats {
 struct Stats {
     filename: String,
     funcs: usize,
-    instructions: InstructionStats,
+    instr: InstructionStats,
     size: SizeStats,
     imports: ExternalStats,
     exports: ExternalStats,
@@ -78,7 +76,7 @@ fn calc_size(wasm: &impl wasmbin::io::Encode) -> Result<usize> {
 }
 
 fn get_instruction_stats(funcs: &[Blob<FuncBody>]) -> Result<InstructionStats> {
-    use wasmbin::instructions::{simd::SIMD, Instruction as I, MemArg, Misc as M};
+    use wasmbin::instructions::{simd::SIMD, Instruction as I, Misc as M};
 
     let mut stats = InstructionStats::default();
     for func in funcs {
@@ -97,67 +95,285 @@ fn get_instruction_stats(funcs: &[Blob<FuncBody>]) -> Result<InstructionStats> {
                 | I::BrTable { .. }
                 | I::Return
                 | I::Select
-                | I::SelectWithTypes(_) => stats.categories.control_flow += 1,
+                | I::SelectWithTypes(_)
+                | I::Nop
+                | I::Drop => stats.categories.control_flow += 1,
                 I::SIMD(i) => {
                     stats.proposals.simd += 1;
-                    if let SIMD::V128Const(_) = i {
-                        stats.categories.constants += 1
+                    match i {
+                        SIMD::V128Load(_)
+                        | SIMD::V128Load8x8S(_)
+                        | SIMD::V128Load8x8U(_)
+                        | SIMD::V128Load16x4S(_)
+                        | SIMD::V128Load16x4U(_)
+                        | SIMD::V128Load32x2S(_)
+                        | SIMD::V128Load32x2U(_)
+                        | SIMD::V128Load8Splat(_)
+                        | SIMD::V128Load16Splat(_)
+                        | SIMD::V128Load32Splat(_)
+                        | SIMD::V128Load64Splat(_)
+                        | SIMD::V128Store(_)
+                        | SIMD::V128Load8Lane(_, _)
+                        | SIMD::V128Load16Lane(_, _)
+                        | SIMD::V128Load32Lane(_, _)
+                        | SIMD::V128Load64Lane(_, _)
+                        | SIMD::V128Store8Lane(_, _)
+                        | SIMD::V128Store16Lane(_, _)
+                        | SIMD::V128Store32Lane(_, _)
+                        | SIMD::V128Store64Lane(_, _) => stats.categories.load_store += 1,
+                        SIMD::V128Const(_) => stats.categories.constants += 1,
+                        _ => stats.categories.other += 1,
                     }
                 }
-                I::Atomic(_) => stats.proposals.atomics += 1,
-                I::RefFunc(_) | I::RefIsNull | I::RefNull(_) => stats.proposals.ref_types += 1,
+                I::Atomic(i) => {
+                    stats.proposals.atomics += 1;
+                    match i {
+                        wasmbin::instructions::Atomic::Wake(_)
+                        | wasmbin::instructions::Atomic::I32Wait(_)
+                        | wasmbin::instructions::Atomic::I64Wait(_) => {
+                            stats.categories.wait_notify += 1;
+                        }
+                        wasmbin::instructions::Atomic::I32Load(_)
+                        | wasmbin::instructions::Atomic::I64Load(_)
+                        | wasmbin::instructions::Atomic::I32Load8U(_)
+                        | wasmbin::instructions::Atomic::I32Load16U(_)
+                        | wasmbin::instructions::Atomic::I64Load8U(_)
+                        | wasmbin::instructions::Atomic::I64Load16U(_)
+                        | wasmbin::instructions::Atomic::I64Load32U(_)
+                        | wasmbin::instructions::Atomic::I32Store(_)
+                        | wasmbin::instructions::Atomic::I64Store(_)
+                        | wasmbin::instructions::Atomic::I32Store8(_)
+                        | wasmbin::instructions::Atomic::I32Store16(_)
+                        | wasmbin::instructions::Atomic::I64Store8(_)
+                        | wasmbin::instructions::Atomic::I64Store16(_)
+                        | wasmbin::instructions::Atomic::I64Store32(_) => {
+                            stats.categories.load_store += 1;
+                        }
+                        _ => stats.categories.other += 1,
+                    }
+                }
+                I::RefFunc(_) | I::RefIsNull | I::RefNull(_) => {
+                    stats.proposals.ref_types += 1;
+                    match i {
+                        I::RefIsNull => stats.categories.other += 1,
+                        _ => stats.categories.constants += 1,
+                    }
+                }
                 I::Misc(i) => match i {
                     M::MemoryInit { .. }
                     | M::MemoryCopy { .. }
                     | M::MemoryFill(_)
-                    | M::DataDrop(_)
-                    | M::TableInit { .. }
+                    | M::DataDrop(_) => {
+                        stats.proposals.bulk += 1;
+                        stats.categories.memory += 1;
+                    }
+                    M::TableInit { .. }
                     | M::TableCopy { .. }
                     | M::TableFill(_)
                     | M::ElemDrop(_) => {
                         stats.proposals.bulk += 1;
+                        stats.categories.table += 1;
                     }
-                    _ => {}
+                    M::TableGrow(_) | M::TableSize(_) => {
+                        stats.proposals.ref_types += 1;
+                        stats.categories.table += 1;
+                    }
+                    M::I32TruncSatF32S
+                    | M::I32TruncSatF32U
+                    | M::I32TruncSatF64S
+                    | M::I32TruncSatF64U
+                    | M::I64TruncSatF32S
+                    | M::I64TruncSatF32U
+                    | M::I64TruncSatF64S
+                    | M::I64TruncSatF64U => {
+                        stats.proposals.non_trapping_conv += 1;
+                        stats.categories.other += 1;
+                    }
                 },
                 I::Call(_) => stats.categories.direct_calls += 1,
                 I::CallIndirect(_) => stats.categories.indirect_calls += 1,
                 I::ReturnCall(_) => {
+                    stats.categories.control_flow += 1;
                     stats.categories.direct_calls += 1;
                     stats.proposals.tail_calls += 1;
                 }
                 I::ReturnCallIndirect(_) => {
+                    stats.categories.control_flow += 1;
                     stats.categories.indirect_calls += 1;
                     stats.proposals.tail_calls += 1;
                 }
                 I::I32Const(_) | I::I64Const(_) | I::F32Const(_) | I::F64Const(_) => {
                     stats.categories.constants += 1
                 }
-                _ => {}
+                I::LocalGet(_) | I::LocalSet(_) | I::LocalTee(_) => {
+                    stats.categories.local_var += 1;
+                }
+                I::GlobalGet(_) | I::GlobalSet(_) => {
+                    stats.categories.global_var += 1;
+                }
+                I::TableGet(_) | I::TableSet(_) => {
+                    stats.categories.table += 1;
+                }
+                I::I32Load(_)
+                | I::I64Load(_)
+                | I::F32Load(_)
+                | I::F64Load(_)
+                | I::I32Load8S(_)
+                | I::I32Load8U(_)
+                | I::I32Load16S(_)
+                | I::I32Load16U(_)
+                | I::I64Load8S(_)
+                | I::I64Load8U(_)
+                | I::I64Load16S(_)
+                | I::I64Load16U(_)
+                | I::I64Load32S(_)
+                | I::I64Load32U(_)
+                | I::I32Store(_)
+                | I::I64Store(_)
+                | I::F32Store(_)
+                | I::F64Store(_)
+                | I::I32Store8(_)
+                | I::I32Store16(_)
+                | I::I64Store8(_)
+                | I::I64Store16(_)
+                | I::I64Store32(_) => {
+                    stats.categories.load_store += 1;
+                }
+                I::MemorySize(_) | I::MemoryGrow(_) => {
+                    stats.categories.memory += 1;
+                }
+                I::I32Eqz
+                | I::I32Eq
+                | I::I32Ne
+                | I::I32LtS
+                | I::I32LtU
+                | I::I32GtS
+                | I::I32GtU
+                | I::I32LeS
+                | I::I32LeU
+                | I::I32GeS
+                | I::I32GeU
+                | I::I64Eqz
+                | I::I64Eq
+                | I::I64Ne
+                | I::I64LtS
+                | I::I64LtU
+                | I::I64GtS
+                | I::I64GtU
+                | I::I64LeS
+                | I::I64LeU
+                | I::I64GeS
+                | I::I64GeU
+                | I::F32Eq
+                | I::F32Ne
+                | I::F32Lt
+                | I::F32Gt
+                | I::F32Le
+                | I::F32Ge
+                | I::F64Eq
+                | I::F64Ne
+                | I::F64Lt
+                | I::F64Gt
+                | I::F64Le
+                | I::F64Ge
+                | I::I32Clz
+                | I::I32Ctz
+                | I::I32PopCnt
+                | I::I32Add
+                | I::I32Sub
+                | I::I32Mul
+                | I::I32DivS
+                | I::I32DivU
+                | I::I32RemS
+                | I::I32RemU
+                | I::I32And
+                | I::I32Or
+                | I::I32Xor
+                | I::I32Shl
+                | I::I32ShrS
+                | I::I32ShrU
+                | I::I32RotL
+                | I::I32RotR
+                | I::I64Clz
+                | I::I64Ctz
+                | I::I64PopCnt
+                | I::I64Add
+                | I::I64Sub
+                | I::I64Mul
+                | I::I64DivS
+                | I::I64DivU
+                | I::I64RemS
+                | I::I64RemU
+                | I::I64And
+                | I::I64Or
+                | I::I64Xor
+                | I::I64Shl
+                | I::I64ShrS
+                | I::I64ShrU
+                | I::I64RotL
+                | I::I64RotR
+                | I::F32Abs
+                | I::F32Neg
+                | I::F32Ceil
+                | I::F32Floor
+                | I::F32Trunc
+                | I::F32Nearest
+                | I::F32Sqrt
+                | I::F32Add
+                | I::F32Sub
+                | I::F32Mul
+                | I::F32Div
+                | I::F32Min
+                | I::F32Max
+                | I::F32CopySign
+                | I::F64Abs
+                | I::F64Neg
+                | I::F64Ceil
+                | I::F64Floor
+                | I::F64Trunc
+                | I::F64Nearest
+                | I::F64Sqrt
+                | I::F64Add
+                | I::F64Sub
+                | I::F64Mul
+                | I::F64Div
+                | I::F64Min
+                | I::F64Max
+                | I::F64CopySign
+                | I::I32WrapI64
+                | I::I32TruncF32S
+                | I::I32TruncF332U
+                | I::I32TruncF64S
+                | I::I32TruncF64U
+                | I::I64ExtendI32S
+                | I::I64ExtendI32U
+                | I::I64TruncF32S
+                | I::I64TruncF32U
+                | I::I64TruncF64S
+                | I::I64TruncF64U
+                | I::F32ConvertI32S
+                | I::F32ConvertI32U
+                | I::F32ConvertI64S
+                | I::F32ConvertI64U
+                | I::F32DemoteF64
+                | I::F64ConvertI32S
+                | I::F64ConvertI32U
+                | I::F64ConvertI64S
+                | I::F64ConvertI64U
+                | I::F64PromoteF32
+                | I::I32ReinterpretF32
+                | I::I64ReinterpretF64
+                | I::F32ReinterpretI32
+                | I::F64ReinterpretI64
+                | I::I32Extend8S
+                | I::I32Extend16S
+                | I::I64Extend8S
+                | I::I64Extend16S
+                | I::I64Extend32S => {
+                    stats.categories.other += 1;
+                }
             }
         }
-        // Covers all load and store instruction - those are the only ones containing MemArg,
-        // and only one MemArg.
-        func.visit(|_: &MemArg| {
-            stats.categories.load_store += 1;
-            // Those don't technically reference MemId because they assume single memory,
-            // but count them as memory refs anyway.
-            stats.refs.mem += 1;
-        })?;
-        // Now count all MemId references (normally in `memory.*` instructions).
-        func.visit(|_: &MemId| {
-            stats.refs.mem += 1;
-        })?;
-        // Same for ops on locals.
-        func.visit(|_: &LocalId| {
-            stats.refs.local += 1;
-        })?;
-        // Same for ops on globals.
-        func.visit(|_: &GlobalId| {
-            stats.refs.global += 1;
-        })?;
-        func.visit(|_: &TableId| {
-            stats.refs.table += 1;
-        })?;
     }
     Ok(stats)
 }
@@ -194,7 +410,7 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
         stats.size.code = calc_size(code)?;
         let funcs = code.try_contents()?;
         stats.funcs = funcs.len();
-        stats.instructions = get_instruction_stats(funcs)?;
+        stats.instr = get_instruction_stats(funcs)?;
     }
     if let Some(section) = m.find_std_section::<payload::Data>() {
         stats.size.init += calc_size(section)?;
@@ -209,6 +425,21 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
     if let Some(section) = m.find_std_section::<payload::Export>() {
         stats.size.externals += calc_size(section)?;
         stats.exports = get_external_stats!(section, wasmbin::sections::ExportDesc);
+    }
+    if let Some(section) = m.find_std_section::<payload::Type>() {
+        stats.size.types += calc_size(section)?;
+        for ty in section.try_contents()? {
+            if ty.results.len() > 1 {
+                stats.instr.proposals.multi_value += 1;
+            }
+        }
+    }
+    if let Some(section) = m.find_std_section::<payload::Memory>() {
+        for ty in section.try_contents()? {
+            if ty.is_shared {
+                stats.instr.proposals.atomics += 1;
+            }
+        }
     }
     Ok(stats)
 }
