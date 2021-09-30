@@ -5,7 +5,8 @@ use serde::Serialize;
 use std::io::Write;
 use wasmbin::{
     builtins::Blob,
-    sections::{payload, FuncBody},
+    sections::{payload, ExportDesc, FuncBody, ImportDesc},
+    types::GlobalType,
 };
 use written_size::WrittenSize;
 
@@ -19,6 +20,7 @@ struct ProposalStats {
     multi_value: usize,
     non_trapping_conv: usize,
     sign_extend: usize,
+    mutable_externals: usize,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -303,11 +305,26 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
     }
     if let Some(section) = m.find_std_section::<payload::Import>() {
         stats.size.externals += calc_size(section)?;
-        stats.imports = get_external_stats!(section, wasmbin::sections::ImportDesc);
+        stats.imports = get_external_stats!(section, ImportDesc);
+        for item in section.try_contents()? {
+            if let ImportDesc::Global(GlobalType { mutable: true, .. }) = item.desc {
+                stats.instr.proposals.mutable_externals += 1;
+            }
+        }
     }
     if let Some(section) = m.find_std_section::<payload::Export>() {
         stats.size.externals += calc_size(section)?;
-        stats.exports = get_external_stats!(section, wasmbin::sections::ExportDesc);
+        stats.exports = get_external_stats!(section, ExportDesc);
+        if let Some(globals) = m.find_std_section::<payload::Global>() {
+            let globals = globals.try_contents()?;
+            for item in section.try_contents()? {
+                if let ExportDesc::Global(global_id) = item.desc {
+                    if globals[global_id.index as usize].ty.mutable {
+                        stats.instr.proposals.mutable_externals += 1;
+                    }
+                }
+            }
+        }
     }
     if let Some(section) = m.find_std_section::<payload::Type>() {
         stats.size.types += calc_size(section)?;
