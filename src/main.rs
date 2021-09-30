@@ -475,40 +475,45 @@ fn main() -> Result<()> {
         })
         .collect::<Result<HashSet<_>>>()?;
 
-    let files = std::fs::read_dir(&dir)?
+    let new_files = std::fs::read_dir(&dir)?
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("wasm"))
+        .filter(|path| {
+            !prev_files.contains(
+                path.file_name()
+                    .expect("Missing filename")
+                    .to_str()
+                    .expect("Invalid filename"),
+            )
+        })
         .collect::<Vec<_>>();
 
-    let pb = ProgressBar::new(files.len() as _);
+    let pb = ProgressBar::new((prev_files.len() + new_files.len()) as _);
+
+    pb.inc(prev_files.len() as _);
 
     let output = std::sync::Mutex::new(std::io::BufWriter::new(output));
 
-    let errors = files
+    let errors = new_files
         .into_par_iter()
         .filter_map(|path| {
             let filename = path
                 .file_name()
-                .expect("Missing filename")
-                .to_str()
-                .expect("Invalid filename")
+                .and_then(|res| res.to_str())
+                .unwrap()
                 .to_owned();
-            let result = if prev_files.contains(&filename) {
+            let handler = || -> Result<()> {
+                let wasm = std::fs::read(&path)?;
+                let mut stats = get_stats(&wasm)?;
+                stats.filename = &filename;
+                stats.size.wasm_opt = wasm_opt(&path)?;
+                let flattened = serde_value_flatten::to_flatten_maptree("_", None, &stats)?;
+                // Serialize to string to ensure atomic write of an entire line.
+                let serialized = serde_json::to_string(&flattened)? + "\n";
+                output.lock().unwrap().write_all(serialized.as_bytes())?;
                 Ok(())
-            } else {
-                let handler = || -> Result<()> {
-                    let wasm = std::fs::read(&path)?;
-                    let mut stats = get_stats(&wasm)?;
-                    stats.filename = &filename;
-                    stats.size.wasm_opt = wasm_opt(&path)?;
-                    let flattened = serde_value_flatten::to_flatten_maptree("_", None, &stats)?;
-                    // Serialize to string to ensure atomic write of an entire line.
-                    let serialized = serde_json::to_string(&flattened)? + "\n";
-                    output.lock().unwrap().write_all(serialized.as_bytes())?;
-                    Ok(())
-                };
-                handler()
             };
+            let result = handler();
             pb.inc(1);
             Some(result.err()?.context(filename))
         })
