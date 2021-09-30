@@ -5,7 +5,9 @@ use serde::Serialize;
 use std::io::Write;
 use wasmbin::{
     builtins::Blob,
-    sections::{payload, ExportDesc, FuncBody, ImportDesc, Section},
+    sections::{ExportDesc, FuncBody, ImportDesc, Section},
+    types::ValueType,
+    visit::Visit,
 };
 use written_size::WrittenSize;
 
@@ -20,6 +22,7 @@ struct ProposalStats {
     non_trapping_conv: usize,
     sign_extend: usize,
     mutable_externals: usize,
+    bigint_externals: usize,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -271,7 +274,7 @@ macro_rules! get_external_stats {
 
         let mut stats = ExternalStats::default();
 
-        for external in $section.try_contents()? {
+        for external in $section {
             match external.desc {
                 Func(_) => stats.funcs += 1,
                 Global(_) => stats.globals += 1,
@@ -284,6 +287,21 @@ macro_rules! get_external_stats {
     }};
 }
 
+struct MaybeExternal<T> {
+    pub value: T,
+    pub is_external: bool,
+}
+
+impl<T> MaybeExternal<T> {
+    fn external(self) -> Option<T> {
+        if self.is_external {
+            Some(self.value)
+        } else {
+            None
+        }
+    }
+}
+
 fn get_stats(wasm: &[u8]) -> Result<Stats> {
     let m = wasmbin::Module::decode_from(wasm)?;
     let mut stats = Stats {
@@ -294,62 +312,53 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
         ..Default::default()
     };
     let mut global_types = Vec::new();
+    let mut func_types = Vec::new();
+    let mut types = &[] as &[_];
     for section in &m.sections {
         match section {
-            Section::Code(section) => {
-                stats.size.code = calc_size(section)?;
-                let funcs = section.try_contents()?;
-                stats.funcs = funcs.len();
-                stats.instr = get_instruction_stats(funcs)?;
-            }
-            Section::Data(section) => {
-                stats.size.init += calc_size(section)?;
-            }
-            Section::Element(section) => {
-                stats.size.init += calc_size(section)?;
-            }
-            Section::Import(section) => {
-                stats.size.externals += calc_size(section)?;
-                stats.imports = get_external_stats!(section, ImportDesc);
-                for item in section.try_contents()? {
-                    if let ImportDesc::Global(ty) = &item.desc {
-                        global_types.push(ty.clone());
-                        if ty.mutable {
-                            stats.instr.proposals.mutable_externals += 1;
-                        }
-                    }
-                }
-            }
-            Section::Export(section) => {
-                stats.size.externals += calc_size(section)?;
-                stats.exports = get_external_stats!(section, ExportDesc);
-                if let Some(globals) = m.find_std_section::<payload::Global>() {
-                    global_types.extend(
-                        globals
-                            .try_contents()?
-                            .iter()
-                            .map(|global| global.ty.clone()),
-                    );
-                }
-                for item in section.try_contents()? {
-                    if let ExportDesc::Global(global_id) = item.desc {
-                        if global_types
-                            .get(global_id.index as usize)
-                            .ok_or_else(|| anyhow!("Invalid global id {:?}", global_id))?
-                            .mutable
-                        {
-                            stats.instr.proposals.mutable_externals += 1;
-                        }
-                    }
-                }
+            Section::Custom(section) => {
+                stats.size.custom += calc_size(section)?;
             }
             Section::Type(section) => {
                 stats.size.types += calc_size(section)?;
-                for ty in section.try_contents()? {
+                types = section.try_contents()?;
+                for ty in types {
                     if ty.results.len() > 1 {
                         stats.instr.proposals.multi_value += 1;
                     }
                 }
+            }
+            Section::Import(section) => {
+                stats.size.externals += calc_size(section)?;
+                let section = section.try_contents()?;
+                stats.imports = get_external_stats!(section, ImportDesc);
+                for item in section {
+                    match &item.desc {
+                        ImportDesc::Global(ty) => {
+                            global_types.push(MaybeExternal {
+                                value: ty.clone(),
+                                is_external: true,
+                            });
+                        }
+                        ImportDesc::Func(type_id) => {
+                            func_types.push(MaybeExternal {
+                                value: *type_id,
+                                is_external: true,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Section::Function(section) => {
+                stats.size.descriptors += calc_size(section)?;
+                func_types.extend(section.try_contents()?.iter().map(|type_id| MaybeExternal {
+                    value: *type_id,
+                    is_external: false,
+                }));
+            }
+            Section::Table(section) => {
+                stats.size.descriptors += calc_size(section)?;
             }
             Section::Memory(section) => {
                 stats.size.descriptors += calc_size(section)?;
@@ -359,28 +368,70 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
                     }
                 }
             }
-            Section::Custom(section) => {
-                stats.size.custom += calc_size(section)?;
+            Section::Global(section) => {
+                stats.size.descriptors += calc_size(section)?;
+                global_types.extend(section.try_contents()?.iter().map(|global| MaybeExternal {
+                    value: global.ty.clone(),
+                    is_external: false,
+                }));
+            }
+            Section::Export(section) => {
+                stats.size.externals += calc_size(section)?;
+                let section = section.try_contents()?;
+                stats.exports = get_external_stats!(section, ExportDesc);
+                for item in section {
+                    match item.desc {
+                        ExportDesc::Global(global_id) => {
+                            global_types[global_id.index as usize].is_external = true;
+                        }
+                        ExportDesc::Func(func_id) => {
+                            func_types[func_id.index as usize].is_external = true;
+                        }
+                        _ => {}
+                    }
+                }
             }
             Section::Start(_) => {
                 stats.has_start = true;
             }
+            Section::Element(section) => {
+                stats.size.init += calc_size(section)?;
+            }
             Section::DataCount(_) => {
                 stats.instr.proposals.bulk += 1;
             }
-            Section::Function(section) => {
-                stats.size.descriptors += calc_size(section)?;
+            Section::Code(section) => {
+                stats.size.code = calc_size(section)?;
+                let funcs = section.try_contents()?;
+                stats.funcs = funcs.len();
+                stats.instr = get_instruction_stats(funcs)?;
             }
-
-            Section::Table(section) => {
-                stats.size.descriptors += calc_size(section)?;
-            }
-
-            Section::Global(section) => {
-                stats.size.descriptors += calc_size(section)?;
+            Section::Data(section) => {
+                stats.size.init += calc_size(section)?;
             }
         }
     }
+    global_types
+        .into_iter()
+        .filter_map(MaybeExternal::external)
+        .for_each(|ty| {
+            if ty.mutable {
+                stats.instr.proposals.mutable_externals += 1;
+            }
+            if let ValueType::I64 = ty.value_type {
+                stats.instr.proposals.bigint_externals += 1;
+            }
+        });
+    func_types
+        .into_iter()
+        .filter_map(MaybeExternal::external)
+        .try_for_each(|type_id| {
+            types[type_id.index as usize].visit(|ty: &ValueType| {
+                if let ValueType::I64 = ty {
+                    stats.instr.proposals.bigint_externals += 1;
+                }
+            })
+        })?;
     Ok(stats)
 }
 
