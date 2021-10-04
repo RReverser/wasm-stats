@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use duct::cmd;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -61,7 +60,9 @@ struct SizeStats {
     custom: usize,
     descriptors: usize,
     total: usize,
-    wasm_opt: usize,
+    total_br: usize,
+    total_opt: Option<usize>,
+    total_opt_br: Option<usize>,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -441,13 +442,8 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
     Ok(stats)
 }
 
-fn wasm_opt(path: &Path) -> Result<usize> {
-    let mut written_size = Vec::new();
-    std::io::copy(
-        &mut cmd!("wasm-opt", "-O", "-n", "-o", "-", path).reader()?,
-        &mut written_size,
-    )?;
-    Ok(written_size.len() as usize)
+fn file_size(path: impl AsRef<Path>) -> std::io::Result<usize> {
+    std::fs::metadata(path).map(|metadata| metadata.len() as _)
 }
 
 fn main() -> Result<()> {
@@ -506,7 +502,9 @@ fn main() -> Result<()> {
                 let wasm = std::fs::read(&path)?;
                 let mut stats = get_stats(&wasm)?;
                 stats.filename = &filename;
-                stats.size.wasm_opt = wasm_opt(&path)?;
+                stats.size.total_br = file_size(path.with_extension("wasm.br"))?;
+                stats.size.total_opt = file_size(path.with_extension("wasm.opt")).ok();
+                stats.size.total_opt_br = file_size(path.with_extension("wasm.opt.br")).ok();
                 let flattened = serde_value_flatten::to_flatten_maptree("_", None, &stats)?;
                 // Serialize to string to ensure atomic write of an entire line.
                 let serialized = serde_json::to_string(&flattened)? + "\n";
