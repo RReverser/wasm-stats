@@ -81,6 +81,7 @@ struct Stats<'a> {
     size: SizeStats,
     imports: ExternalStats,
     exports: ExternalStats,
+    custom_sections: Vec<String>,
     has_start: bool,
 }
 
@@ -325,6 +326,9 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
         match section {
             Section::Custom(section) => {
                 stats.size.custom += calc_size(section)?;
+                stats
+                    .custom_sections
+                    .push(section.try_contents()?.name().to_owned());
             }
             Section::Type(section) => {
                 stats.size.types += calc_size(section)?;
