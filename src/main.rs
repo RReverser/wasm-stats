@@ -505,9 +505,8 @@ fn main() -> Result<()> {
                 stats.size.total_br = file_size(path.with_extension("wasm.br"))?;
                 stats.size.total_opt = file_size(path.with_extension("wasm.opt")).ok();
                 stats.size.total_opt_br = file_size(path.with_extension("wasm.opt.br")).ok();
-                let flattened = serde_value_flatten::to_flatten_maptree("_", None, &stats)?;
                 // Serialize to string to ensure atomic write of an entire line.
-                let serialized = serde_json::to_string(&flattened)? + "\n";
+                let serialized = serde_json::to_string(&stats)? + "\n";
                 output.lock().unwrap().write_all(serialized.as_bytes())?;
                 Ok(())
             };
