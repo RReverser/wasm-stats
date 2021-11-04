@@ -61,8 +61,10 @@ struct SizeStats {
     descriptors: usize,
     total: usize,
     total_br: usize,
-    total_opt: Option<usize>,
-    total_opt_br: Option<usize>,
+    total_strip: usize,
+    total_strip_br: usize,
+    total_opt: usize,
+    total_opt_br: usize,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -507,8 +509,10 @@ fn main() -> Result<()> {
                 let mut stats = get_stats(&wasm)?;
                 stats.filename = &filename;
                 stats.size.total_br = file_size(path.with_extension("wasm.br"))?;
-                stats.size.total_opt = file_size(path.with_extension("wasm.opt")).ok();
-                stats.size.total_opt_br = file_size(path.with_extension("wasm.opt.br")).ok();
+                stats.size.total_strip = file_size(path.with_extension("wasm.strip"))?;
+                stats.size.total_strip_br = file_size(path.with_extension("wasm.strip.br"))?;
+                stats.size.total_opt = file_size(path.with_extension("wasm.opt"))?;
+                stats.size.total_opt_br = file_size(path.with_extension("wasm.opt.br"))?;
                 // Serialize to string to ensure atomic write of an entire line.
                 let serialized = serde_json::to_string(&stats)? + "\n";
                 output.lock().unwrap().write_all(serialized.as_bytes())?;
