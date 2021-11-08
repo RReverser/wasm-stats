@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 use wasmbin::{
     builtins::Blob,
@@ -448,8 +448,18 @@ fn get_stats(wasm: &[u8]) -> Result<Stats> {
     Ok(stats)
 }
 
-fn file_size(path: impl AsRef<Path>) -> std::io::Result<usize> {
-    std::fs::metadata(path).map(|metadata| metadata.len() as _)
+fn path_to_filename(path: &Path) -> Result<&str> {
+    path.file_name()
+        .context("Missing filename")?
+        .to_str()
+        .context("Invalid filename")
+}
+
+fn file_size(path: impl AsRef<Path>) -> Result<usize> {
+    let path = path.as_ref();
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len() as _)
+        .with_context(move || path_to_filename(path).unwrap_or("(no filename)").to_owned())
 }
 
 fn main() -> Result<()> {
@@ -480,14 +490,7 @@ fn main() -> Result<()> {
     let new_files = std::fs::read_dir(&dir)?
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("wasm"))
-        .filter(|path| {
-            !prev_files.contains(
-                path.file_name()
-                    .expect("Missing filename")
-                    .to_str()
-                    .expect("Invalid filename"),
-            )
-        })
+        .filter(|path| !prev_files.contains(path_to_filename(path).unwrap()))
         .collect::<Vec<_>>();
 
     let pb = ProgressBar::new((prev_files.len() + new_files.len()) as _);
@@ -499,11 +502,7 @@ fn main() -> Result<()> {
     let errors = new_files
         .into_par_iter()
         .filter_map(|path| {
-            let filename = path
-                .file_name()
-                .and_then(|res| res.to_str())
-                .unwrap()
-                .to_owned();
+            let filename = path_to_filename(&path).unwrap().to_owned();
             let handler = || -> Result<()> {
                 let wasm = std::fs::read(&path)?;
                 let mut stats = get_stats(&wasm)?;
