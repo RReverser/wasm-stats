@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 use wasmbin::{
     builtins::Blob,
